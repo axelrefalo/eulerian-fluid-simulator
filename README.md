@@ -1,4 +1,4 @@
-# Basic-Eulerian-Fluid-Simulator
+# eulerian-fluid-simulator
 Basic Eulerian Fluid Simulator inspired by @matthias-research
 
 
