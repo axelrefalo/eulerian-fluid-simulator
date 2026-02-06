@@ -56,7 +56,7 @@ int main()
     VertexArray Grid[GRID_SIZE_X][GRID_SIZE_Y];
 
     // Create a window type RenderWindow
-    RenderWindow SimuWindow(VideoMode(GRID_SIZE_Y * CELL_SIZE, GRID_SIZE_X * CELL_SIZE), "Fluid Simulation");
+    RenderWindow SimuWindow(VideoMode({GRID_SIZE_Y * CELL_SIZE, GRID_SIZE_X * CELL_SIZE}), "Fluid Simulation");
     
     SimuWindow.clear(); // Clear the window 
     InitFluid(Fluid); // Initilaize the initial conditions od the fluid
@@ -70,10 +70,9 @@ int main()
     }
 
     while (SimuWindow.isOpen()) {
-        Event event;
-        while (SimuWindow.pollEvent(event)) {
-            // Close the window if we close the window 
-            if (event.type == Event::Closed) {
+        while (auto event = SimuWindow.pollEvent()) {
+            // Close the window if we close the window
+            if (event->is<Event::Closed>()) {
                 SimuWindow.close(); // close the window
             }
         }
@@ -160,7 +159,7 @@ void InitGrid(VertexArray grid[GRID_SIZE_X][GRID_SIZE_Y]) {
     for (int i = 0; i < GRID_SIZE_X; ++i) {
         for (int j = 0; j < GRID_SIZE_Y; ++j) {
 
-            grid[i][j].setPrimitiveType(Quads);
+            grid[i][j].setPrimitiveType(PrimitiveType::TriangleFan);
             grid[i][j].resize(4);
 
             grid[i][j][0].position = Vector2f(j * CELL_SIZE, i * CELL_SIZE);
