@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Wind Tunnel — Fluid Playground</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #ffffff;
+    --panel: #f2f2f2;
+    --border: #bbbbbb;
+    --text: #111111;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1c1c;
+      --panel: #262626;
+      --border: #444444;
+      --text: #eeeeee;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #ffffff; --panel: #f2f2f2; --border: #bbbbbb; --text: #111111;
+  }
+  :root[data-theme="dark"] {
+    --bg: #1c1c1c; --panel: #262626; --border: #444444; --text: #eeeeee;
+  }
+
+  * { box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    overflow: hidden;
+  }
+  .app { display: flex; height: 100%; }
+
+  .stage {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    min-width: 0;
+  }
+  #sim {
+    max-width: 100%;
+    max-height: 100%;
+    width: auto;
+    height: auto;
+    border: 1px solid var(--border);
+    touch-action: none;
+    cursor: crosshair;
+  }
+
+  .tray {
+    flex: 0 0 auto;
+    width: 84px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 20px;
+    padding: 20px 0;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+  }
+  .tray-item {
+    width: 56px;
+    height: 56px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .tray-item:active { cursor: grabbing; }
+  .tray-item:focus-visible {
+    outline: 2px solid var(--text);
+    outline-offset: 2px;
+  }
+  .tray-item svg { display: block; pointer-events: none; }
+  .tray-item.used {
+    opacity: .2;
+    pointer-events: none;
+    cursor: default;
+  }
+
+  .ghost {
+    position: fixed;
+    top: 0;
+    left: 0;
+    background: red;
+    opacity: .75;
+    pointer-events: none;
+    transform: translate(-50%, -50%);
+    display: none;
+    z-index: 1000;
+  }
+</style>
+</head>
+<body>
+
+<div class="app">
+  <main class="stage">
+    <canvas id="sim"></canvas>
+  </main>
+  <aside class="tray" aria-label="Obstacle shapes, drag onto the tunnel">
+    <div class="tray-item" data-shape="circle" title="Circle" tabindex="0">
+      <svg width="32" height="32" viewBox="0 0 32 32"><circle cx="16" cy="16" r="14" fill="red"/></svg>
+    </div>
+    <div class="tray-item" data-shape="square" title="Square" tabindex="0">
+      <svg width="32" height="32" viewBox="0 0 32 32"><rect x="3" y="3" width="26" height="26" fill="red"/></svg>
+    </div>
+    <div class="tray-item" data-shape="plate" title="Flat plate" tabindex="0">
+      <svg width="32" height="32" viewBox="0 0 32 32"><rect x="12" y="2" width="8" height="28" fill="red"/></svg>
+    </div>
+  </aside>
+  <div id="ghost" class="ghost"></div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---- Grid & physics constants (mirrors the C++ solver) ----
+  const GX = 100;              // rows (i)
+  const GY = 120;              // columns (j)
+  const SCALE = 8;             // px per cell
+  const TIME_STEP = 0.01;
+  const OVERRELAXATION = 1.9;
+  const PROJECTION_ITERATIONS = 40;
+  const WARMUP_ITERATIONS = 1000;
+  const INFLOW_SPEED = 110;
+  const OBSTACLE_RADIUS = 8;
+  const SOURCE_I_MIN = 35, SOURCE_I_MAX = 63;
+  const STRIPE_FRAMES = 15;
+  const MAX_OBSTACLE_SPEED = 300;
+
+  const eIdx = (i, j) => i * GY + j;
+  const fIdx = (i, j, k) => (i * GY + j) * 3 + k;
+  const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+
+  const env = new Float32Array(GX * GY);
+  const fluid = new Float32Array(GX * GY * 3);
+  const fluidPrev = new Float32Array(GX * GY * 3);
+
+  function interp(c1, c2, c3, c4, x, y) {
+    return c1 * (1 - x) * (1 - y) + c2 * (1 - x) * y + c3 * x * (1 - y) + c4 * x * y;
+  }
+
+  // ---- Obstacles ----
+  // Exactly three: one circle, one square, one plate. Each lives either in
+  // the tray (unused) or in the tunnel (in this array) - never duplicated.
+  const obstacles = [
+    { id: 'circle', i: GX * 0.5, j: GY * 0.33, shape: 'circle', r: OBSTACLE_RADIUS, dragging: false, velI: 0, velJ: 0 }
+  ];
+  let selectedId = null;
+
+  function insideShape(i, j, ob) {
+    const di = i - ob.i, dj = j - ob.j, r = ob.r;
+    if (ob.shape === 'square') return Math.abs(di) <= r && Math.abs(dj) <= r;
+    if (ob.shape === 'plate') return Math.abs(dj) <= r * 0.15 && Math.abs(di) <= r * 1.5;
+    return di * di + dj * dj <= r * r;
+  }
+
+  function rebuildEnvironment() {
+    env.fill(0);
+    for (let i = 1; i < GX - 1; i++) {
+      for (let j = 1; j < GY - 1; j++) env[eIdx(i, j)] = 1;
+    }
+    for (const ob of obstacles) {
+      const iMin = Math.max(1, Math.floor(ob.i - ob.r * 1.6));
+      const iMax = Math.min(GX - 2, Math.ceil(ob.i + ob.r * 1.6));
+      const jMin = Math.max(1, Math.floor(ob.j - ob.r * 1.6));
+      const jMax = Math.min(GY - 2, Math.ceil(ob.j + ob.r * 1.6));
+      for (let i = iMin; i <= iMax; i++) {
+        for (let j = jMin; j <= jMax; j++) {
+          if (!insideShape(i, j, ob)) continue;
+          env[eIdx(i, j)] = 0;
+          if (ob.dragging) {
+            fluid[fIdx(i, j, 0)] = ob.velI;
+            fluid[fIdx(i, j, 1)] = ob.velJ;
+          }
+        }
+      }
+    }
+  }
+
+  // ---- Solver ----
+  function incompressibility() {
+    for (let i = 1; i < GX - 1; i++) {
+      for (let j = 1; j < GY - 1; j++) {
+        if (env[eIdx(i, j)] !== 1) continue;
+        const eL = env[eIdx(i, j - 1)], eR = env[eIdx(i, j + 1)];
+        const eT = env[eIdx(i - 1, j)], eB = env[eIdx(i + 1, j)];
+        const numCell = eL + eR + eT + eB;
+        if (numCell === 0) continue;
+        const div = OVERRELAXATION * (fluid[fIdx(i, j, 0)] - fluid[fIdx(i, j + 1, 0)] + fluid[fIdx(i, j, 1)] - fluid[fIdx(i + 1, j, 1)]);
+        fluid[fIdx(i, j, 0)] -= div * eL / numCell;
+        fluid[fIdx(i, j + 1, 0)] += div * eR / numCell;
+        fluid[fIdx(i, j, 1)] -= div * eT / numCell;
+        fluid[fIdx(i + 1, j, 1)] += div * eB / numCell;
+      }
+    }
+  }
+
+  function velocityAdvection() {
+    for (let i = 1; i < GX - 1; i++) {
+      for (let j = 1; j < GY - 1; j++) {
+        if (env[eIdx(i, j)] !== 1) continue;
+
+        const vAtU = 0.25 * (fluidPrev[fIdx(i, j, 1)] + fluidPrev[fIdx(i + 1, j, 1)] + fluidPrev[fIdx(i, j - 1, 1)] + fluidPrev[fIdx(i + 1, j - 1, 1)]);
+        let xU = clamp(i - TIME_STEP * vAtU, 1, GX - 2);
+        let yU = clamp(j - TIME_STEP * fluidPrev[fIdx(i, j, 0)], 1, GY - 2);
+        const cxu = Math.floor(xU), cyu = Math.floor(yU);
+        xU -= cxu; yU -= cyu;
+        fluid[fIdx(i, j, 0)] = interp(
+          fluidPrev[fIdx(cxu, cyu, 0)], fluidPrev[fIdx(cxu, cyu + 1, 0)],
+          fluidPrev[fIdx(cxu + 1, cyu, 0)], fluidPrev[fIdx(cxu + 1, cyu + 1, 0)], xU, yU);
+
+        const uAtV = 0.25 * (fluidPrev[fIdx(i, j, 0)] + fluidPrev[fIdx(i, j + 1, 0)] + fluidPrev[fIdx(i - 1, j, 0)] + fluidPrev[fIdx(i - 1, j + 1, 0)]);
+        let xV = clamp(i - TIME_STEP * fluidPrev[fIdx(i, j, 1)], 1, GX - 2);
+        let yV = clamp(j - TIME_STEP * uAtV, 1, GY - 2);
+        const cxv = Math.floor(xV), cyv = Math.floor(yV);
+        xV -= cxv; yV -= cyv;
+        fluid[fIdx(i, j, 1)] = interp(
+          fluidPrev[fIdx(cxv, cyv, 1)], fluidPrev[fIdx(cxv, cyv + 1, 1)],
+          fluidPrev[fIdx(cxv + 1, cyv, 1)], fluidPrev[fIdx(cxv + 1, cyv + 1, 1)], xV, yV);
+      }
+    }
+  }
+
+  function smokeAdvection() {
+    for (let i = 1; i < GX - 1; i++) {
+      for (let j = 1; j < GY - 1; j++) {
+        if (env[eIdx(i, j)] !== 1) continue;
+        const VSpeed = (fluidPrev[fIdx(i, j, 1)] + fluidPrev[fIdx(i + 1, j, 1)]) * 0.5;
+        const USpeed = (fluidPrev[fIdx(i, j, 0)] + fluidPrev[fIdx(i, j + 1, 0)]) * 0.5;
+        let x = clamp(i - TIME_STEP * VSpeed, 1, GX - 2);
+        let y = clamp(j - TIME_STEP * USpeed, 1, GY - 2);
+        const cx = Math.floor(x), cy = Math.floor(y);
+        x -= cx; y -= cy;
+        fluid[fIdx(i, j, 2)] = interp(
+          fluidPrev[fIdx(cx, cy, 2)], fluidPrev[fIdx(cx, cy + 1, 2)],
+          fluidPrev[fIdx(cx + 1, cy, 2)], fluidPrev[fIdx(cx + 1, cy + 1, 2)], x, y);
+      }
+    }
+  }
+
+  function resetInflow() {
+    for (let i = 1; i < GX - 1; i++) {
+      if (env[eIdx(i, 1)] === 1) fluid[fIdx(i, 1, 0)] = INFLOW_SPEED;
+    }
+  }
+
+  let frameCount = 0;
+  function reseedSource() {
+    frameCount++;
+    const stripeOn = Math.floor(frameCount / STRIPE_FRAMES) % 2 === 0;
+    for (let i = SOURCE_I_MIN; i <= SOURCE_I_MAX; i++) {
+      if (env[eIdx(i, 1)] === 1) fluid[fIdx(i, 1, 2)] = stripeOn ? 1 : 0;
+    }
+  }
+
+  // ---- Rendering ----
+  const canvas = document.getElementById('sim');
+  canvas.width = GY * SCALE;
+  canvas.height = GX * SCALE;
+  const ctx = canvas.getContext('2d');
+  const off = document.createElement('canvas');
+  off.width = GY; off.height = GX;
+  const offCtx = off.getContext('2d');
+  const imgData = offCtx.createImageData(GY, GX);
+
+  // Same coloring as the C++ UpdateGrid(): grayscale fluid cells (smoke
+  // concentration 0..1 -> 0..255), plain red obstacle cells. No theming.
+  function render() {
+    const data = imgData.data;
+    for (let i = 0; i < GX; i++) {
+      for (let j = 0; j < GY; j++) {
+        const p = (i * GY + j) * 4;
+        if (env[eIdx(i, j)] === 1) {
+          const gray = Math.round(clamp(fluid[fIdx(i, j, 2)], 0, 1) * 255);
+          data[p] = gray; data[p + 1] = gray; data[p + 2] = gray;
+        } else {
+          data[p] = 255; data[p + 1] = 0; data[p + 2] = 0;
+        }
+        data[p + 3] = 255;
+      }
+    }
+    offCtx.putImageData(imgData, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(off, 0, 0, GY, GX, 0, 0, canvas.width, canvas.height);
+  }
+
+  // ---- Interaction ----
+  function toGrid(evt) {
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const px = (evt.clientX - rect.left) * scaleX;
+    const py = (evt.clientY - rect.top) * scaleY;
+    return { i: py / SCALE, j: px / SCALE };
+  }
+
+  function updateTray() {
+    document.querySelectorAll('.tray-item').forEach((item) => {
+      const active = obstacles.some((o) => o.shape === item.dataset.shape);
+      item.classList.toggle('used', active);
+    });
+  }
+
+  function removeObstacle(id) {
+    const idx = obstacles.findIndex((o) => o.id === id);
+    if (idx !== -1) obstacles.splice(idx, 1);
+    if (selectedId === id) selectedId = null;
+    updateTray();
+  }
+
+  function isOutsideCanvas(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    return clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom;
+  }
+
+  // Move an obstacle already in the tunnel; dragging it back out deletes it.
+  let dragState = null;
+
+  canvas.addEventListener('pointerdown', (e) => {
+    const { i, j } = toGrid(e);
+    let hit = null;
+    for (let k = obstacles.length - 1; k >= 0; k--) {
+      if (insideShape(i, j, obstacles[k])) { hit = obstacles[k]; break; }
+    }
+    if (!hit) return;
+    selectedId = hit.id;
+    hit.velI = 0; hit.velJ = 0;
+    dragState = { ob: hit, lastI: i, lastJ: j };
+    canvas.setPointerCapture(e.pointerId);
+  });
+
+  canvas.addEventListener('pointermove', (e) => {
+    if (!dragState) return;
+    const { i, j } = toGrid(e);
+    const velI = clamp((i - dragState.lastI) / TIME_STEP, -MAX_OBSTACLE_SPEED, MAX_OBSTACLE_SPEED);
+    const velJ = clamp((j - dragState.lastJ) / TIME_STEP, -MAX_OBSTACLE_SPEED, MAX_OBSTACLE_SPEED);
+    dragState.ob.i = clamp(i, 2, GX - 3);
+    dragState.ob.j = clamp(j, 2, GY - 3);
+    dragState.ob.velI = velI;
+    dragState.ob.velJ = velJ;
+    dragState.ob.dragging = true;
+    dragState.lastI = i;
+    dragState.lastJ = j;
+  });
+
+  canvas.addEventListener('pointerup', (e) => {
+    if (!dragState) return;
+    const ob = dragState.ob;
+    ob.dragging = false;
+    ob.velI = 0;
+    ob.velJ = 0;
+    if (isOutsideCanvas(e.clientX, e.clientY)) removeObstacle(ob.id);
+    dragState = null;
+  });
+
+  canvas.addEventListener('pointercancel', () => {
+    if (dragState) {
+      dragState.ob.dragging = false;
+      dragState.ob.velI = 0;
+      dragState.ob.velJ = 0;
+      dragState = null;
+    }
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId != null) {
+      e.preventDefault();
+      removeObstacle(selectedId);
+    }
+  });
+
+  // Drag a shape out of the tray to place a new obstacle in the tunnel.
+  const ghost = document.getElementById('ghost');
+  let spawnShape = null;
+
+  function moveGhost(clientX, clientY) {
+    ghost.style.left = clientX + 'px';
+    ghost.style.top = clientY + 'px';
+  }
+
+  function setGhostShape(shape) {
+    ghost.style.borderRadius = shape === 'circle' ? '50%' : '0';
+    if (shape === 'plate') {
+      ghost.style.width = '14px';
+      ghost.style.height = '84px';
+    } else {
+      ghost.style.width = '56px';
+      ghost.style.height = '56px';
+    }
+  }
+
+  document.querySelectorAll('.tray-item').forEach((item) => {
+    item.addEventListener('pointerdown', (e) => {
+      const shape = item.dataset.shape;
+      if (obstacles.some((o) => o.shape === shape)) return; // already in the tunnel
+      spawnShape = shape;
+      setGhostShape(spawnShape);
+      moveGhost(e.clientX, e.clientY);
+      ghost.style.display = 'block';
+      item.setPointerCapture(e.pointerId);
+    });
+
+    item.addEventListener('pointermove', (e) => {
+      if (!spawnShape) return;
+      moveGhost(e.clientX, e.clientY);
+    });
+
+    item.addEventListener('pointerup', (e) => {
+      if (!spawnShape) return;
+      if (!isOutsideCanvas(e.clientX, e.clientY)) {
+        const rect = canvas.getBoundingClientRect();
+        const j = clamp(((e.clientX - rect.left) * (canvas.width / rect.width)) / SCALE, 2, GY - 3);
+        const i = clamp(((e.clientY - rect.top) * (canvas.height / rect.height)) / SCALE, 2, GX - 3);
+        const ob = { id: spawnShape, i, j, shape: spawnShape, r: OBSTACLE_RADIUS, dragging: false, velI: 0, velJ: 0 };
+        obstacles.push(ob);
+        selectedId = ob.id;
+        updateTray();
+      }
+      spawnShape = null;
+      ghost.style.display = 'none';
+    });
+
+    item.addEventListener('pointercancel', () => {
+      spawnShape = null;
+      ghost.style.display = 'none';
+    });
+  });
+
+  // ---- Main loop ----
+  function tick() {
+    rebuildEnvironment();
+    for (let n = 0; n < PROJECTION_ITERATIONS; n++) incompressibility();
+    resetInflow();
+    fluidPrev.set(fluid);
+    velocityAdvection();
+    fluidPrev.set(fluid);
+    smokeAdvection();
+    reseedSource();
+    render();
+    requestAnimationFrame(tick);
+  }
+
+  rebuildEnvironment();
+  resetInflow();
+  for (let n = 0; n < WARMUP_ITERATIONS; n++) incompressibility();
+  updateTray();
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
