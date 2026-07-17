@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Wind Tunnel — Fluid Playground</title>
+<title>Fluid Simulator</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   :root {
@@ -34,36 +34,53 @@
     color: var(--text);
     overflow: hidden;
   }
-  .app { display: flex; height: 100%; }
-
-  .stage {
-    flex: 1;
+  .app {
+    height: 100%;
     display: flex;
     align-items: center;
     justify-content: center;
     padding: 16px;
+  }
+
+  .workspace {
+    display: flex;
+    align-items: flex-end;
+    gap: 18px;
+  }
+
+  .stage {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
     min-width: 0;
   }
+  #titleCanvas {
+    display: block;
+    image-rendering: pixelated;
+    image-rendering: -moz-crisp-edges;
+    image-rendering: crisp-edges;
+  }
   #sim {
-    max-width: 100%;
-    max-height: 100%;
+    max-width: 80vw;
+    max-height: 80vh;
     width: auto;
     height: auto;
     border: 1px solid var(--border);
     touch-action: none;
     cursor: crosshair;
+    image-rendering: pixelated;
+    image-rendering: -moz-crisp-edges;
+    image-rendering: crisp-edges;
   }
 
   .tray {
     flex: 0 0 auto;
-    width: 84px;
     display: flex;
     flex-direction: column;
     align-items: center;
     gap: 20px;
-    padding: 20px 0;
-    background: var(--panel);
-    border-left: 1px solid var(--border);
+    padding-bottom: 4px;
   }
   .tray-item {
     width: 56px;
@@ -104,20 +121,23 @@
 <body>
 
 <div class="app">
-  <main class="stage">
-    <canvas id="sim"></canvas>
-  </main>
-  <aside class="tray" aria-label="Obstacle shapes, drag onto the tunnel">
-    <div class="tray-item" data-shape="circle" title="Circle" tabindex="0">
-      <svg width="32" height="32" viewBox="0 0 32 32"><circle cx="16" cy="16" r="14" fill="red"/></svg>
-    </div>
-    <div class="tray-item" data-shape="square" title="Square" tabindex="0">
-      <svg width="32" height="32" viewBox="0 0 32 32"><rect x="3" y="3" width="26" height="26" fill="red"/></svg>
-    </div>
-    <div class="tray-item" data-shape="plate" title="Flat plate" tabindex="0">
-      <svg width="32" height="32" viewBox="0 0 32 32"><rect x="12" y="2" width="8" height="28" fill="red"/></svg>
-    </div>
-  </aside>
+  <div class="workspace">
+    <main class="stage">
+      <canvas id="titleCanvas"></canvas>
+      <canvas id="sim"></canvas>
+    </main>
+    <aside class="tray" aria-label="Obstacle shapes, drag onto the tunnel">
+      <div class="tray-item" data-shape="circle" title="Circle" tabindex="0">
+        <svg width="32" height="32" viewBox="0 0 32 32"><circle cx="16" cy="16" r="14" fill="red"/></svg>
+      </div>
+      <div class="tray-item" data-shape="square" title="Square" tabindex="0">
+        <svg width="32" height="32" viewBox="0 0 32 32"><rect x="3" y="3" width="26" height="26" fill="red"/></svg>
+      </div>
+      <div class="tray-item" data-shape="plate" title="Flat plate" tabindex="0">
+        <svg width="32" height="32" viewBox="0 0 32 32"><rect x="12" y="2" width="8" height="28" fill="red"/></svg>
+      </div>
+    </aside>
+  </div>
   <div id="ghost" class="ghost"></div>
 </div>
 
@@ -125,7 +145,6 @@
 (function () {
   'use strict';
 
-  // ---- Grid & physics constants (mirrors the C++ solver) ----
   const GX = 100;              // rows (i)
   const GY = 120;              // columns (j)
   const SCALE = 8;             // px per cell
@@ -151,9 +170,8 @@
     return c1 * (1 - x) * (1 - y) + c2 * (1 - x) * y + c3 * x * (1 - y) + c4 * x * y;
   }
 
-  // ---- Obstacles ----
-  // Exactly three: one circle, one square, one plate. Each lives either in
-  // the tray (unused) or in the tunnel (in this array) - never duplicated.
+  // Exactly three obstacles - one circle, one square, one plate - each
+  // either in the tray (unused) or in the tunnel (in this array), never duplicated.
   const obstacles = [
     { id: 'circle', i: GX * 0.5, j: GY * 0.33, shape: 'circle', r: OBSTACLE_RADIUS, dragging: false, velI: 0, velJ: 0 }
   ];
@@ -189,7 +207,6 @@
     }
   }
 
-  // ---- Solver ----
   function incompressibility() {
     for (let i = 1; i < GX - 1; i++) {
       for (let j = 1; j < GY - 1; j++) {
@@ -265,7 +282,38 @@
     }
   }
 
-  // ---- Rendering ----
+  // Rasterized at a tiny font size then scaled up with smoothing disabled -
+  // same nearest-neighbor trick as the simulation grid below, so it reads as pixel art.
+  (function renderPixelTitle() {
+    const text = 'FLUID SIMULATOR';
+    const fontPx = 9;
+    const pad = 3;
+    const scale = 4;
+
+    const measure = document.createElement('canvas').getContext('2d');
+    measure.font = `bold ${fontPx}px "Courier New", monospace`;
+    const textWidth = Math.ceil(measure.measureText(text).width);
+
+    const smallW = textWidth + pad * 2;
+    const smallH = fontPx + pad * 2;
+
+    const small = document.createElement('canvas');
+    small.width = smallW;
+    small.height = smallH;
+    const smallCtx = small.getContext('2d');
+    smallCtx.font = `bold ${fontPx}px "Courier New", monospace`;
+    smallCtx.textBaseline = 'top';
+    smallCtx.fillStyle = '#000000';
+    smallCtx.fillText(text, pad, pad);
+
+    const titleCanvas = document.getElementById('titleCanvas');
+    titleCanvas.width = smallW * scale;
+    titleCanvas.height = smallH * scale;
+    const tctx = titleCanvas.getContext('2d');
+    tctx.imageSmoothingEnabled = false;
+    tctx.drawImage(small, 0, 0, smallW, smallH, 0, 0, titleCanvas.width, titleCanvas.height);
+  })();
+
   const canvas = document.getElementById('sim');
   canvas.width = GY * SCALE;
   canvas.height = GX * SCALE;
@@ -275,8 +323,7 @@
   const offCtx = off.getContext('2d');
   const imgData = offCtx.createImageData(GY, GX);
 
-  // Same coloring as the C++ UpdateGrid(): grayscale fluid cells (smoke
-  // concentration 0..1 -> 0..255), plain red obstacle cells. No theming.
+  // Same coloring as the C++ UpdateGrid(): grayscale fluid cells, plain red obstacle cells.
   function render() {
     const data = imgData.data;
     for (let i = 0; i < GX; i++) {
@@ -296,7 +343,6 @@
     ctx.drawImage(off, 0, 0, GY, GX, 0, 0, canvas.width, canvas.height);
   }
 
-  // ---- Interaction ----
   function toGrid(evt) {
     const rect = canvas.getBoundingClientRect();
     const scaleX = canvas.width / rect.width;
@@ -404,7 +450,7 @@
   document.querySelectorAll('.tray-item').forEach((item) => {
     item.addEventListener('pointerdown', (e) => {
       const shape = item.dataset.shape;
-      if (obstacles.some((o) => o.shape === shape)) return; // already in the tunnel
+      if (obstacles.some((o) => o.shape === shape)) return;
       spawnShape = shape;
       setGhostShape(spawnShape);
       moveGhost(e.clientX, e.clientY);
@@ -438,7 +484,6 @@
     });
   });
 
-  // ---- Main loop ----
   function tick() {
     rebuildEnvironment();
     for (let n = 0; n < PROJECTION_ITERATIONS; n++) incompressibility();
